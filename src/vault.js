@@ -19,12 +19,44 @@ function parseUnlockAt(unlockAt) {
   return timestamp;
 }
 
-function deriveKey(passphrase, salt) {
-  return crypto.scryptSync(passphrase, salt, KEY_SIZE);
+// OWASP Password Storage Cheat Sheet, first scrypt row: N=2^17, r=8, p=1
+// (128 MiB). Node's own default is N=2^14, an eighth of the work, which is
+// what capsules before version 3 were sealed with. A capsule is a file an
+// attacker can copy and brute-force offline for as long as they like, so
+// the cost per guess is the whole defence of a weak passphrase.
+export const KDF_PARAMS = Object.freeze({ N: 2 ** 17, r: 8, p: 1 });
+const LEGACY_KDF_PARAMS = Object.freeze({ N: 2 ** 14, r: 8, p: 1 });
+
+// A capsule names its own cost, so a hostile one could ask for N=2^30 and
+// stall or crash whoever opens it. Anything above this ceiling is refused.
+const MAX_KDF_MEMORY = 1024 * 1024 * 1024;
+
+function kdfMemory({ N, r, p }) {
+  return 128 * N * r * p;
 }
 
-function aadString(version, algorithm, unlockAt, createdAt) {
-  return `v=${version}|alg=${algorithm}|unlockAt=${unlockAt}|createdAt=${createdAt}`;
+function readKdfParams(capsule) {
+  if (Number(capsule.version || 1) < 3) return LEGACY_KDF_PARAMS;
+  const params = capsule.kdfParams;
+  const valid =
+    params &&
+    [params.N, params.r, params.p].every(Number.isSafeInteger) &&
+    params.N > 1 && (params.N & (params.N - 1)) === 0 &&
+    params.r > 0 && params.p > 0;
+  if (!valid) throw new Error("CapsuleInvalidKdfParams");
+  if (kdfMemory(params) > MAX_KDF_MEMORY) throw new Error("CapsuleKdfTooExpensive");
+  return { N: params.N, r: params.r, p: params.p };
+}
+
+function deriveKey(passphrase, salt, params) {
+  // Node refuses anything over maxmem (32 MiB by default), so size it to the
+  // parameters with headroom for its own bookkeeping.
+  return crypto.scryptSync(passphrase, salt, KEY_SIZE, { ...params, maxmem: 2 * kdfMemory(params) });
+}
+
+function aadString(version, algorithm, unlockAt, createdAt, params) {
+  const base = `v=${version}|alg=${algorithm}|unlockAt=${unlockAt}|createdAt=${createdAt}`;
+  return version >= 3 ? `${base}|kdf=scrypt:N=${params.N},r=${params.r},p=${params.p}` : base;
 }
 
 function ensureCapsuleShape(capsule) {
@@ -48,10 +80,10 @@ export function createCapsule(payload, passphrase, unlockAt, nowMs = Date.now())
 
   const salt = crypto.randomBytes(16);
   const iv = crypto.randomBytes(12);
-  const key = deriveKey(passphrase, salt);
+  const key = deriveKey(passphrase, salt, KDF_PARAMS);
   const createdAt = new Date(nowMs).toISOString();
-  const version = 2;
-  const aad = Buffer.from(aadString(version, ALGORITHM, unlockAt, createdAt), "utf8");
+  const version = 3;
+  const aad = Buffer.from(aadString(version, ALGORITHM, unlockAt, createdAt, KDF_PARAMS), "utf8");
 
   const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
   cipher.setAAD(aad);
@@ -62,6 +94,7 @@ export function createCapsule(payload, passphrase, unlockAt, nowMs = Date.now())
   return {
     version,
     kdf: "scrypt",
+    kdfParams: { ...KDF_PARAMS },
     algorithm: ALGORITHM,
     unlockAt,
     createdAt,
@@ -83,12 +116,13 @@ export function openCapsule(capsule, passphrase, nowMs = Date.now()) {
   const iv = fromBase64(capsule.iv);
   const tag = fromBase64(capsule.tag);
   const ciphertext = fromBase64(capsule.ciphertext);
-  const key = deriveKey(passphrase, salt);
+  const params = readKdfParams(capsule);
+  const key = deriveKey(passphrase, salt, params);
 
   const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
   if (Number(capsule.version || 1) >= 2) {
     const aad = Buffer.from(
-      aadString(Number(capsule.version || 2), capsule.algorithm, capsule.unlockAt, capsule.createdAt),
+      aadString(Number(capsule.version || 2), capsule.algorithm, capsule.unlockAt, capsule.createdAt, params),
       "utf8"
     );
     decipher.setAAD(aad);
